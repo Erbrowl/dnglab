@@ -273,12 +273,8 @@ impl<'a> Rw2Decoder<'a> {
       let r = fetch_tiff_tag!(self.tiff, PanasonicTag::BlackLevelRed).force_u16(0);
       let g = fetch_tiff_tag!(self.tiff, PanasonicTag::BlackLevelGreen).force_u16(0);
       let b = fetch_tiff_tag!(self.tiff, PanasonicTag::BlackLevelBlue).force_u16(0);
-      Ok(Some(BlackLevel::new(
-        &[r + offset, g + offset, g + offset, b + offset],
-        self.camera.cfa.width,
-        self.camera.cfa.height,
-        1,
-      )))
+      let cfa = self.get_cfa()?.unwrap_or_else(|| self.camera.cfa.clone());
+      Ok(Some(blacklevel_by_site(&cfa, [r + offset, g + offset, b + offset])))
     } else {
       Ok(None)
     }
@@ -459,4 +455,24 @@ pub enum PanasonicTag {
 pub enum CameraIfdTag {
   LensTypeMake = 0x1201,
   LensTypeModel = 0x1202,
+}
+
+/// Black levels are given per color; `correct_blacklevel_cfa` reads them per 2x2 site.
+fn blacklevel_by_site(cfa: &CFA, [r, g, b]: [u16; 3]) -> BlackLevel {
+  let levels: Vec<u16> = (0..4).map(|i| [r, g, b][cfa.color_at(i / 2, i % 2).min(2)]).collect();
+  BlackLevel::new(&levels, 2, 2, 1)
+}
+
+#[cfg(test)]
+mod blacklevel_tests {
+  use super::*;
+
+  #[test]
+  fn black_follows_cfa() {
+    // GX9 P1029504: tags R 128, G 129, B 127, +15; Adobe DNG BlackLevel 142 144 144 143.
+    let bggr = blacklevel_by_site(&CFA::new("BGGR"), [143, 144, 142]);
+    assert_eq!(bggr, BlackLevel::new(&[142_u16, 144, 144, 143], 2, 2, 1));
+    let rggb = blacklevel_by_site(&CFA::new("RGGB"), [143, 144, 142]);
+    assert_eq!(rggb, BlackLevel::new(&[143_u16, 144, 144, 142], 2, 2, 1));
+  }
 }
