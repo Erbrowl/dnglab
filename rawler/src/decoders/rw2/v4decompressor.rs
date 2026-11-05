@@ -1,4 +1,4 @@
-use crate::{bits::LEu16, decoders::*, pumps::BitPump};
+use crate::{decoders::*, pumps::BitPump};
 
 pub(crate) fn decode_panasonic_v4(buf: &[u8], width: usize, height: usize, split: bool, dummy: bool) -> PixU16 {
   decode_threaded_multiline(
@@ -64,6 +64,15 @@ impl<'a> BitPumpPanasonic<'a> {
       split,
     }
   }
+
+  /// Byte `idx` of the current block in load order, zero past its end.
+  fn block_byte(&self, idx: usize) -> u32 {
+    if idx >= 0x4000 {
+      return 0;
+    }
+    let idx = if self.split { (idx + 0x4000 - 0x2008) % 0x4000 } else { idx };
+    self.buffer.get(self.pos - 0x4000 + idx).copied().unwrap_or(0) as u32
+  }
 }
 
 impl<'a> BitPump for BitPumpPanasonic<'a> {
@@ -72,15 +81,74 @@ impl<'a> BitPump for BitPumpPanasonic<'a> {
       self.nbits += 0x4000 * 8;
       self.pos += 0x4000;
     }
-    let mut byte = ((self.nbits - num) >> 3) ^ 0x3ff0;
-    if self.split {
-      byte = (byte + 0x4000 - 0x2008) % 0x4000;
-    }
-    let bits = LEu16(self.buffer, byte as usize + self.pos - 0x4000) as u32;
+    // The two bytes are read from the 0x4000 byte block in its load order, as LibRaw does:
+    // the byte after the last one is zero, never the first byte of the next block, and with
+    // `split` both bytes go through the remapping, not only the first one.
+    let byte = (((self.nbits - num) >> 3) ^ 0x3ff0) as usize;
+    let bits = self.block_byte(byte) | (self.block_byte(byte + 1) << 8);
     (bits >> ((self.nbits - num) & 7)) & (0x0ffffffffu32 >> (32 - num))
   }
 
   fn consume_bits(&mut self, num: u32) {
     self.nbits -= num;
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Port of LibRaw's `pana_data()` for the non-v5 formats (decoders_dcraw.cpp).
+  struct LibRawPump<'a> {
+    file: &'a [u8],
+    file_pos: usize,
+    buf: [u8; 0x4002],
+    vpos: u32,
+    load_flags: usize,
+  }
+
+  impl<'a> LibRawPump<'a> {
+    fn get_bits(&mut self, nb: u32) -> u32 {
+      if self.vpos == 0 {
+        let lf = self.load_flags;
+        self.buf[lf..0x4000].copy_from_slice(&self.file[self.file_pos..self.file_pos + 0x4000 - lf]);
+        self.buf[..lf].copy_from_slice(&self.file[self.file_pos + 0x4000 - lf..self.file_pos + 0x4000]);
+        self.file_pos += 0x4000;
+      }
+      self.vpos = (self.vpos.wrapping_sub(nb)) & 0x1ffff;
+      let byte = ((self.vpos >> 3) ^ 0x3ff0) as usize;
+      ((self.buf[byte] as u32 | (self.buf[byte + 1] as u32) << 8) >> (self.vpos & 7)) & !(!0u32 << nb)
+    }
+  }
+
+  #[test]
+  fn pump_matches_libraw_across_block_ends() {
+    // Two blocks of pseudo-random bytes, read with the widths the v4 decoder uses.
+    let mut state = 0x1234_5678_u32;
+    let file: Vec<u8> = (0..2 * 0x4000)
+      .map(|_| {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (state >> 24) as u8
+      })
+      .collect();
+    let widths = [2, 8, 4, 8, 8];
+    for split in [false, true] {
+      let mut ours = BitPumpPanasonic::new(&file, split);
+      let mut libraw = LibRawPump {
+        file: &file,
+        file_pos: 0,
+        buf: [0; 0x4002],
+        vpos: 0,
+        load_flags: if split { 0x2008 } else { 0x4000 },
+      };
+      let mut read = 0;
+      let mut n = 0;
+      while read + 8 <= 2 * 0x4000 * 8 {
+        let w = widths[n % widths.len()];
+        assert_eq!(ours.get_bits(w), libraw.get_bits(w), "split {split}, read {n} at bit {read}");
+        read += w as usize;
+        n += 1;
+      }
+    }
   }
 }
